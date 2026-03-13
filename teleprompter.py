@@ -10,6 +10,8 @@ import wave
 import os
 import threading
 import time
+import json
+import shutil
 from parser import parse_transcript_file, format_time
 
 
@@ -68,11 +70,15 @@ class TeleprompterApp:
         self.is_playing = False
         self.is_recording = False
         self.is_previewing = False
+        self.current_transcript_path = None  # 当前字幕文件路径
+        self.current_project_path = None  # 当前工程存档目录
         
         # 录音相关
         self.recordings_dir = "recordings"
         self.recording_data = []
         self.recording_states = {}  # {index: True/False} 记录是否已录制
+        self.skip_states = {}  # {index: True/False} 语气词跳过，合成时填静音
+        self.merge_groups = []  # [[0],[1,2],[3],...] 合并组，同组内连续播放无间隔
         self.sample_rate = 44100
         self.preview_stream = None
         
@@ -251,6 +257,21 @@ class TeleprompterApp:
         )
         batch_btn.pack(side=tk.LEFT, padx=5, pady=15)
         ToolTip(batch_btn, "标记低分句子\n批量跳转需要重录的句子")
+        
+        # 一键静音裁剪按钮
+        auto_trim_btn = tk.Button(
+            top_frame,
+            text="✂️ 静音裁剪",
+            font=('Microsoft YaHei', 11),
+            bg='#9955aa',
+            fg='white',
+            command=self.batch_auto_trim_silence,
+            width=12,
+            relief=tk.FLAT,
+            cursor='hand2'
+        )
+        auto_trim_btn.pack(side=tk.LEFT, padx=5, pady=15)
+        ToolTip(auto_trim_btn, "一键裁剪所有已录音频首尾静音\n根据波形自动识别前后平坦区域")
         
         # 状态标签
         self.status_label = tk.Label(
@@ -490,6 +511,22 @@ class TeleprompterApp:
         self.export_btn.grid(row=0, column=6, padx=5)
         ToolTip(self.export_btn, "导出完整音频 (快捷键: Enter)\n合并所有录音片段\n生成完整的WAV文件")
         
+        # 试听合并版
+        self.preview_merge_btn = tk.Button(
+            buttons_container,
+            text="📀",
+            font=('Arial', 16),
+            bg='#555555',
+            fg='white',
+            command=self.preview_merged_audio,
+            width=4,
+            height=1,
+            relief=tk.FLAT,
+            cursor='hand2'
+        )
+        self.preview_merge_btn.grid(row=0, column=7, padx=5)
+        ToolTip(self.preview_merge_btn, "试听合并版\n预览导出后的完整音频效果")
+        
         # 音量监控条（录制时显示）
         volume_frame = tk.Frame(control_frame, bg='#1a1a1a')
         volume_frame.place(relx=0.1, rely=0.8, anchor=tk.W)
@@ -567,6 +604,8 @@ class TeleprompterApp:
         self.root.bind('<Delete>', lambda e: self.delete_recording())
         self.root.bind('<F1>', lambda e: self.show_help_dialog())
         self.root.bind('<F5>', lambda e: self.show_statistics())
+        self.root.bind('<Control-s>', lambda e: self.save_project())
+        self.root.bind('<Control-o>', lambda e: self.load_project())
         
     def load_file(self):
         """加载转录文件"""
@@ -582,11 +621,17 @@ class TeleprompterApp:
     def load_transcript_file(self, file_path):
         """加载转录文件的通用方法"""
         try:
+            self.current_transcript_path = file_path
             self.segments = parse_transcript_file(file_path)
             self.current_index = 0
             self.recording_states = {}
+            self.skip_states = {}
+            self.merge_groups = [[i] for i in range(len(self.segments))]
             self.word_progress = 0.0
             self.invalidate_score_cache()  # 新文件加载，清空评分缓存
+            
+            # 根据 recordings 目录中已存在的文件恢复录制状态
+            self.restore_recording_states()
             
             self.status_label.config(
                 text=f"已加载 {len(self.segments)} 个句子",
@@ -598,6 +643,17 @@ class TeleprompterApp:
             messagebox.showinfo("成功", f"已加载 {len(self.segments)} 个句子")
         except Exception as e:
             messagebox.showerror("错误", f"加载文件失败: {str(e)}")
+    
+    def restore_recording_states(self):
+        """根据 recordings 目录中的已有文件恢复录制完成标记"""
+        if not self.segments:
+            return
+        
+        for seg in self.segments:
+            idx = seg.get('index')
+            file_path = os.path.join(self.recordings_dir, f"segment_{idx:03d}.wav")
+            if os.path.exists(file_path):
+                self.recording_states[idx] = True
     
     def toggle_mode(self):
         """切换自动/手动模式"""
@@ -978,10 +1034,13 @@ class TeleprompterApp:
                     print(f"录音状态: {status}")
                 self.recording_data.append(indata.copy())
             
+            # blocksize 小一些、latency='low' 减少启动延迟，避免开头单词漏录
             self.stream = sd.InputStream(
                 samplerate=self.sample_rate,
                 channels=1,
-                callback=callback
+                callback=callback,
+                blocksize=512,
+                latency='low'
             )
             self.stream.start()
         except Exception as e:
@@ -1133,15 +1192,44 @@ class TeleprompterApp:
         status_label.pack(side=tk.LEFT, padx=5)
         status_label.bind("<Button-1>", lambda e, idx=i: self.jump_to_segment(idx))
         
-        score_label, waveform_btn = None, None
+        # 显示实际录音时长（已录制时）或预期时长
+        dur = self.get_recording_duration(i) if is_recorded else None
+        if dur is not None:
+            dur_text = f"实际 {dur:.1f}s"
+            if seg['duration'] > 0:
+                dur_text += f" (预期{seg['duration']:.1f}s)"
+        else:
+            dur_text = f"预期 {seg['duration']:.1f}s"
+        dur_label = tk.Label(top_row, text=dur_text, font=('Arial', 9), bg=bg_color, fg='#888888')
+        dur_label.pack(side=tk.LEFT, padx=(0, 8))
+        dur_label.bind("<Button-1>", lambda e, idx=i: self.jump_to_segment(idx))
+        
+        score_label, waveform_btn, trim_btn, skip_btn, merge_btn = None, None, None, None, None
+        # 跳过按钮（语气词，合成时填静音）
+        is_skip = self.skip_states.get(i, False)
+        skip_btn = tk.Button(top_row, text="⏭" if is_skip else "跳", font=('Arial', 9), bg=bg_color,
+            fg='#ff9900' if is_skip else '#666666', command=lambda idx=i: self.toggle_skip(idx),
+            relief=tk.FLAT, cursor='hand2', padx=2)
+        skip_btn.pack(side=tk.RIGHT)
+        ToolTip(skip_btn, "跳过(语气词)：合成时用静音填充，不播放录音")
+        # 合并按钮（与下一句合并）
+        if i < len(self.segments) - 1:
+            merge_btn = tk.Button(top_row, text="🔗", font=('Arial', 9), bg=bg_color, fg='#00aaff',
+                command=lambda idx=i: self.merge_with_next(idx), relief=tk.FLAT, cursor='hand2', padx=2)
+            merge_btn.pack(side=tk.RIGHT)
+            ToolTip(merge_btn, "与下一句合并：合成时连续播放无间隔")
         if score is not None:
             score_color = '#00ff00' if score >= 80 else ('#ffaa00' if score >= 60 else '#ff3333')
             score_text = f"⭐ {score}" if score >= 80 else (f"★ {score}" if score >= 60 else f"⚠ {score}")
             score_label = tk.Label(top_row, text=score_text, font=('Arial', 10, 'bold'), bg=bg_color, fg=score_color)
             score_label.pack(side=tk.RIGHT)
             score_label.bind("<Button-1>", lambda e, idx=i: self.jump_to_segment(idx))
+            trim_btn = tk.Button(top_row, text="✂️", font=('Arial', 10), bg=bg_color, fg='#ffaa00',
+                command=lambda idx=i: self.show_trim_dialog(idx), relief=tk.FLAT, cursor='hand2', padx=2)
+            trim_btn.pack(side=tk.RIGHT)
+            ToolTip(trim_btn, "裁剪首尾空白 / 若超时则加速")
             waveform_btn = tk.Button(top_row, text="📊", font=('Arial', 10), bg=bg_color, fg='#00aaff',
-                command=lambda idx=i: self.show_waveform(idx), relief=tk.FLAT, cursor='hand2', padx=5)
+                command=lambda idx=i: self.show_waveform(idx), relief=tk.FLAT, cursor='hand2', padx=2)
             waveform_btn.pack(side=tk.RIGHT, padx=(0, 5))
             ToolTip(waveform_btn, "查看音频波形")
         
@@ -1153,8 +1241,9 @@ class TeleprompterApp:
         
         info = {
             "frame": item_frame, "top_row": top_row, "num_label": num_label,
-            "status_label": status_label, "text_label": text_label,
-            "score_label": score_label, "waveform_btn": waveform_btn,
+            "status_label": status_label, "dur_label": dur_label, "text_label": text_label,
+            "score_label": score_label, "trim_btn": trim_btn, "waveform_btn": waveform_btn,
+            "skip_btn": skip_btn, "merge_btn": merge_btn,
         }
         self._list_item_widgets[i] = info
         return info
@@ -1274,8 +1363,8 @@ class TeleprompterApp:
             
             apply_bg([
                 info["frame"], info["top_row"], info["num_label"],
-                info["status_label"], info["text_label"],
-                info.get("score_label"), info.get("waveform_btn")
+                info["status_label"], info.get("dur_label"), info["text_label"],
+                info.get("score_label"), info.get("trim_btn"), info.get("waveform_btn")
             ], bg_color)
     
     def invalidate_score_cache(self, index=None):
@@ -1284,6 +1373,17 @@ class TeleprompterApp:
             self._score_cache.clear()
         else:
             self._score_cache.pop(index, None)
+    
+    def get_recording_duration(self, index):
+        """获取指定段的实际录音时长（秒），无录音返回 None"""
+        file_path = os.path.join(self.recordings_dir, f"segment_{index:03d}.wav")
+        if not os.path.exists(file_path):
+            return None
+        try:
+            with wave.open(file_path, 'rb') as wf:
+                return wf.getnframes() / float(wf.getframerate())
+        except Exception:
+            return None
     
     def calculate_score(self, index):
         """计算录音质量评分（0-100），使用缓存避免重复计算"""
@@ -1528,6 +1628,159 @@ class TeleprompterApp:
             except Exception as e:
                 messagebox.showerror("错误", f"预览失败: {str(e)}")
     
+    def preview_merged_audio(self):
+        """试听合并版：预览导出后的完整音频"""
+        if not self.segments:
+            messagebox.showwarning("提示", "请先加载转录文件")
+            return
+        if not self.recording_states:
+            messagebox.showwarning("提示", "还没有录制任何音频")
+            return
+        if self.is_previewing:
+            sd.stop()
+            self.is_previewing = False
+            self._cancel_preview_timeline()
+            self.preview_merge_btn.config(text="📀", bg='#555555')
+            self.preview_btn.config(text="🔊", bg='#0078d4')
+            return
+        try:
+            frames_bytes, rate, timeline = self._build_merged_audio_frames()
+            if not frames_bytes:
+                messagebox.showwarning("提示", "没有可播放的音频")
+                return
+            audio_data = np.frombuffer(frames_bytes, dtype=np.int16).astype(np.float32) / 32767.0
+            self.is_previewing = True
+            self._preview_after_ids = []
+            self.preview_merge_btn.config(text="⏹", bg='#ff8800')
+            # 开始时立即切换到第一句
+            if timeline:
+                self.jump_to_segment(timeline[0][0])
+            def finished():
+                self.is_previewing = False
+                self._cancel_preview_timeline()
+                self.preview_merge_btn.config(text="📀", bg='#555555')
+            # 按时间点切换文字高亮
+            for idx, start_sec in timeline:
+                ms = int(start_sec * 1000)
+                aid = self.root.after(ms, lambda i=idx: self._preview_jump_to_segment(i))
+                self._preview_after_ids.append(aid)
+            sd.play(audio_data, rate, blocking=False)
+            duration_ms = int(len(audio_data) / rate * 1000)
+            self.root.after(duration_ms, finished)
+        except Exception as e:
+            self.is_previewing = False
+            self.preview_merge_btn.config(text="📀", bg='#555555')
+            messagebox.showerror("错误", f"试听失败: {str(e)}")
+    
+    def _cancel_preview_timeline(self):
+        """取消试听合并时预定的文字切换"""
+        if hasattr(self, '_preview_after_ids'):
+            for aid in self._preview_after_ids:
+                try:
+                    self.root.after_cancel(aid)
+                except Exception:
+                    pass
+            self._preview_after_ids = []
+    
+    def _preview_jump_to_segment(self, index):
+        """试听合并时切换到指定句并刷新显示"""
+        if not self.is_previewing or not (0 <= index < len(self.segments)):
+            return
+        self.jump_to_segment(index)
+    
+    def save_project(self):
+        """存档当前字幕+音频到工程目录"""
+        if not self.segments or not self.current_transcript_path:
+            messagebox.showwarning("提示", "请先加载字幕文件并完成部分录音后再存档")
+            return
+        project_root = filedialog.askdirectory(
+            title="选择或创建一个工程存档目录（空目录最佳）",
+            mustexist=False
+        )
+        if not project_root:
+            return
+        try:
+            os.makedirs(project_root, exist_ok=True)
+            # 保存字幕副本
+            transcript_name = os.path.basename(self.current_transcript_path)
+            project_transcript = os.path.join(project_root, transcript_name)
+            shutil.copy2(self.current_transcript_path, project_transcript)
+            # 复制音频
+            audio_dir = os.path.join(project_root, "audio")
+            os.makedirs(audio_dir, exist_ok=True)
+            for seg in self.segments:
+                idx = seg.get("index")
+                src = os.path.join(self.recordings_dir, f"segment_{idx:03d}.wav")
+                dst = os.path.join(audio_dir, f"segment_{idx:03d}.wav")
+                if os.path.exists(src):
+                    shutil.copy2(src, dst)
+            # 保存元数据
+            meta = {
+                "transcript_file": transcript_name,
+                "segments_count": len(self.segments),
+                "recording_states": self.recording_states,
+                "skip_states": self.skip_states,
+                "merge_groups": self.merge_groups,
+            }
+            meta_path = os.path.join(project_root, "project_meta.json")
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+            self.current_project_path = project_root
+            messagebox.showinfo("成功", f"工程已存档到：\n{project_root}")
+        except Exception as e:
+            messagebox.showerror("错误", f"存档失败: {e}")
+    
+    def load_project(self):
+        """从工程存档目录恢复字幕和音频"""
+        project_root = filedialog.askdirectory(
+            title="选择工程存档目录（含 project_meta.json）",
+            mustexist=True
+        )
+        if not project_root:
+            return
+        meta_path = os.path.join(project_root, "project_meta.json")
+        if not os.path.exists(meta_path):
+            messagebox.showerror("错误", "所选目录中没有 project_meta.json，无法识别为工程存档")
+            return
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            transcript_name = meta.get("transcript_file")
+            if not transcript_name:
+                raise ValueError("元数据缺少 transcript_file 字段")
+            project_transcript = os.path.join(project_root, transcript_name)
+            if not os.path.exists(project_transcript):
+                raise FileNotFoundError(f"找不到字幕文件：{project_transcript}")
+            # 覆盖 recordings 目录为该工程的音频
+            audio_dir = os.path.join(project_root, "audio")
+            if not os.path.exists(audio_dir):
+                os.makedirs(audio_dir, exist_ok=True)
+            if os.path.exists(self.recordings_dir):
+                try:
+                    for name in os.listdir(self.recordings_dir):
+                        if name.endswith(".wav"):
+                            os.remove(os.path.join(self.recordings_dir, name))
+                except Exception:
+                    pass
+            else:
+                os.makedirs(self.recordings_dir, exist_ok=True)
+            for name in os.listdir(audio_dir):
+                if name.endswith(".wav"):
+                    shutil.copy2(os.path.join(audio_dir, name),
+                                 os.path.join(self.recordings_dir, name))
+            # 加载字幕并套用状态
+            self.load_transcript_file(project_transcript)
+            self.recording_states = meta.get("recording_states", {})
+            self.skip_states = meta.get("skip_states", {})
+            self.merge_groups = meta.get("merge_groups", [[i for i in range(len(self.segments))]])
+            self.invalidate_score_cache()
+            self.refresh_list()
+            self.update_display()
+            self.current_project_path = project_root
+            messagebox.showinfo("成功", f"已从工程恢复：\n{project_root}")
+        except Exception as e:
+            messagebox.showerror("错误", f"读取工程失败: {e}")
+
     def export_audio(self):
         """导出合并的完整音频"""
         if not self.segments:
@@ -1556,37 +1809,53 @@ class TeleprompterApp:
         except Exception as e:
             messagebox.showerror("错误", f"导出失败: {str(e)}")
     
+    def _build_merged_audio_frames(self):
+        """构建合并后的音频帧序列，供导出和试听使用。返回 (frames_bytes, sample_rate, timeline)
+        timeline: [(segment_index, start_sec_in_output), ...] 各句在合并音频中的开始时间"""
+        if not self.segments:
+            return b'', self.sample_rate, []
+        groups = self.merge_groups if self.merge_groups else [[i] for i in range(len(self.segments))]
+        frames_list = []
+        timeline = []
+        output_time = 0.0
+        last_end_time = 0
+        for group in sorted(groups, key=lambda g: min(g)):
+            seg_first = self.segments[group[0]]
+            gap = seg_first['start_time'] - last_end_time
+            if gap > 0:
+                silence_frames = int(gap * self.sample_rate)
+                frames_list.append(np.zeros(silence_frames, dtype=np.int16).tobytes())
+                output_time += gap
+            for i in group:
+                seg = self.segments[i]
+                timeline.append((i, output_time))
+                file_path = os.path.join(self.recordings_dir, f"segment_{i:03d}.wav")
+                if self.skip_states.get(i):
+                    duration_frames = int(seg['duration'] * self.sample_rate)
+                    frames_list.append(np.zeros(duration_frames, dtype=np.int16).tobytes())
+                    output_time += seg['duration']
+                elif os.path.exists(file_path):
+                    with wave.open(file_path, 'rb') as wf:
+                        data = wf.readframes(wf.getnframes())
+                        frames_list.append(data)
+                        output_time += len(data) / 2 / self.sample_rate
+                else:
+                    duration_frames = int(seg['duration'] * self.sample_rate)
+                    frames_list.append(np.zeros(duration_frames, dtype=np.int16).tobytes())
+                    output_time += seg['duration']
+                last_end_time = seg['end_time']
+        return b''.join(frames_list), self.sample_rate, timeline
+    
     def merge_audio_segments(self, output_path):
-        """合并所有录音片段，插入静音间隔"""
+        """合并所有录音片段，插入静音间隔。支持跳过(语气词填静音)与合并组(组内无间隔)"""
+        frames_bytes, rate, _ = self._build_merged_audio_frames()
+        if not frames_bytes:
+            return
         with wave.open(output_path, 'wb') as output_wav:
             output_wav.setnchannels(1)
             output_wav.setsampwidth(2)
-            output_wav.setframerate(self.sample_rate)
-            
-            last_end_time = 0
-            
-            for i, seg in enumerate(self.segments):
-                # 插入静音（如果需要）
-                gap = seg['start_time'] - last_end_time
-                if gap > 0:
-                    silence_frames = int(gap * self.sample_rate)
-                    silence = np.zeros(silence_frames, dtype=np.int16)
-                    output_wav.writeframes(silence.tobytes())
-                
-                # 添加录音片段
-                file_path = os.path.join(self.recordings_dir, f"segment_{i:03d}.wav")
-                
-                if os.path.exists(file_path):
-                    with wave.open(file_path, 'rb') as segment_wav:
-                        frames = segment_wav.readframes(segment_wav.getnframes())
-                        output_wav.writeframes(frames)
-                    last_end_time = seg['end_time']
-                else:
-                    # 如果没有录音，插入静音
-                    duration_frames = int(seg['duration'] * self.sample_rate)
-                    silence = np.zeros(duration_frames, dtype=np.int16)
-                    output_wav.writeframes(silence.tobytes())
-                    last_end_time = seg['end_time']
+            output_wav.setframerate(rate)
+            output_wav.writeframes(frames_bytes)
 
     
     def delete_recording(self):
@@ -1631,6 +1900,42 @@ class TeleprompterApp:
             
         except Exception as e:
             messagebox.showerror("错误", f"删除失败: {str(e)}")
+    
+    def toggle_skip(self, index):
+        """切换跳过状态（语气词，合成时填静音）"""
+        if not self.segments or not (0 <= index < len(self.segments)):
+            return
+        self.skip_states[index] = not self.skip_states.get(index, False)
+        self._update_list_item_safe(index)
+        skip_count = sum(1 for v in self.skip_states.values() if v)
+        self.status_label.config(
+            text=f"#{index+1} 已标记为{'跳过' if self.skip_states[index] else '不跳过'} (共{skip_count}个跳过)" if skip_count else f"#{index+1} 已取消跳过",
+            fg='orange'
+        )
+        self.root.after(2000, lambda: self.status_label.config(text="就绪", fg="black"))
+    
+    def merge_with_next(self, index):
+        """将当前句与下一句合并（合成时连续播放无间隔）"""
+        if not self.segments or index >= len(self.segments) - 1:
+            return
+        gi = gj = -1
+        for k, g in enumerate(self.merge_groups):
+            if index in g:
+                gi = k
+            if index + 1 in g:
+                gj = k
+        if gi < 0 or gj < 0:
+            return
+        if gi == gj:
+            messagebox.showinfo("提示", "这两句已经合并")
+            return
+        new_group = sorted(set(self.merge_groups[gi] + self.merge_groups[gj]))
+        self.merge_groups = [g for k, g in enumerate(self.merge_groups) if k not in (gi, gj)]
+        self.merge_groups.append(new_group)
+        self.merge_groups.sort(key=lambda g: min(g))
+        self.refresh_list()
+        self.status_label.config(text=f"#{index+1} 与 #{index+2} 已合并", fg='#00aa00')
+        self.root.after(2000, lambda: self.status_label.config(text="就绪", fg="black"))
 
     def show_waveform(self, index):
         """显示音频波形"""
@@ -1766,6 +2071,341 @@ class TeleprompterApp:
             
         except Exception as e:
             messagebox.showerror("错误", f"无法显示波形: {str(e)}")
+    
+    def show_trim_dialog(self, index):
+        """裁剪首尾空白，可选项：若仍超时则加速到预期时长"""
+        file_path = os.path.join(self.recordings_dir, f"segment_{index:03d}.wav")
+        if not os.path.exists(file_path):
+            messagebox.showwarning("提示", "该句子还未录制")
+            return
+        
+        try:
+            with wave.open(file_path, 'rb') as wf:
+                nframes = wf.getnframes()
+                rate = wf.getframerate()
+                audio_int16 = np.frombuffer(wf.readframes(nframes), dtype=np.int16)
+            
+            audio_float = audio_int16.astype(np.float32) / 32767.0
+            total_dur = nframes / float(rate)
+            seg = self.segments[index]
+            expected_dur = seg['duration']
+            
+            dlg = tk.Toplevel(self.root)
+            dlg.title(f"裁剪 - 第 {index + 1} 句")
+            dlg.geometry("700x460")
+            dlg.configure(bg='#1a1a1a')
+            dlg.transient(self.root)
+            dlg.grab_set()
+            
+            main_f = tk.Frame(dlg, bg='#1a1a1a', padx=15, pady=12)
+            main_f.pack(fill=tk.BOTH, expand=True)
+            
+            tk.Label(main_f, text=f"总长 {total_dur:.2f}s | 预期 {expected_dur:.2f}s | 点击波形左半设开头、右半设结尾，或拖动绿线",
+                font=('Microsoft YaHei', 10), bg='#1a1a1a', fg='#aaaaaa').pack(anchor=tk.W)
+            
+            canvas_h = 130
+            canv = Canvas(main_f, bg='#0d0d0d', highlightthickness=1, highlightbackground='#444444', height=canvas_h)
+            canv.pack(fill=tk.X, pady=(8, 0))
+            # 时间轴
+            axis_f = tk.Frame(main_f, bg='#1a1a1a')
+            axis_f.pack(fill=tk.X)
+            tk.Label(axis_f, text="0s", font=('Arial', 8), bg='#1a1a1a', fg='#555555').pack(side=tk.LEFT)
+            tk.Label(axis_f, text=f"   {total_dur:.1f}s", font=('Arial', 8), bg='#1a1a1a', fg='#555555').pack(side=tk.RIGHT)
+            
+            var_trim_start = tk.DoubleVar(value=0)
+            var_trim_end = tk.DoubleVar(value=0)
+            drag_line = [None]
+            
+            def draw_all():
+                t0 = var_trim_start.get()
+                t1 = var_trim_end.get()
+                w = canv.winfo_width()
+                if w < 20:
+                    dlg.after(50, draw_all)
+                    return
+                h = canvas_h
+                center_y = h / 2
+                canv.delete("all")
+                spb = max(1, len(audio_float) // w)
+                amp = [np.max(np.abs(audio_float[i:i+spb])) for i in range(0, len(audio_float), spb)]
+                if not amp:
+                    amp = [0]
+                x0 = (t0 / total_dur) * w if total_dur > 0 else 0
+                x1 = w - (t1 / total_dur) * w if total_dur > 0 else w
+                canv.create_rectangle(0, 0, x0, h, fill='#2a1a1a', outline='')
+                canv.create_rectangle(x1, 0, w, h, fill='#2a1a1a', outline='')
+                xs = np.linspace(0, w - 1, len(amp))
+                scale = (h / 2 - 10)
+                for i in range(len(amp) - 1):
+                    xa, xb = xs[i], xs[i + 1]
+                    xm = (xa + xb) / 2
+                    col = '#00aa66' if x0 <= xm <= x1 else '#554444'
+                    ya = center_y - amp[i] * scale
+                    yb = center_y - amp[i + 1] * scale
+                    canv.create_line(xa, ya, xb, yb, fill=col, width=1)
+                    canv.create_line(xa, center_y + (center_y - ya), xb, center_y + (center_y - yb), fill=col, width=1)
+                for tag, x in [("line_start", x0), ("line_end", x1)]:
+                    canv.create_line(x, 0, x, h, fill='#00ff88', width=2, tags=tag)
+                    canv.create_rectangle(x - 8, 0, x + 8, h, fill='', outline='', tags=tag)
+                canv.tag_raise("line_start", "all")
+                canv.tag_raise("line_end", "all")
+            
+            def x_to_time(x):
+                w = canv.winfo_width()
+                return max(0, min(total_dur, (x / w) * total_dur)) if w > 0 else 0
+            
+            def on_click(e):
+                x = max(0, min(canv.winfo_width(), e.x))
+                mx = canv.winfo_width() / 2
+                if x < mx:
+                    t0 = x_to_time(x)
+                    if t0 + var_trim_end.get() < total_dur - 0.02:
+                        var_trim_start.set(t0)
+                else:
+                    t1 = total_dur - x_to_time(x)
+                    if var_trim_start.get() + t1 < total_dur - 0.02 and t1 >= 0:
+                        var_trim_end.set(t1)
+                update_ui()
+            
+            def on_drag(e):
+                if drag_line[0] is None:
+                    return
+                x = max(0, min(canv.winfo_width(), e.x))
+                if drag_line[0] == "start":
+                    t0 = x_to_time(x)
+                    if t0 + var_trim_end.get() < total_dur - 0.02:
+                        var_trim_start.set(t0)
+                else:
+                    t1 = total_dur - x_to_time(x)
+                    if var_trim_start.get() + t1 < total_dur - 0.02 and t1 >= 0:
+                        var_trim_end.set(t1)
+                update_ui()
+            
+            def on_release(e):
+                drag_line[0] = None
+            
+            def nearest_line(x):
+                w = canv.winfo_width()
+                x0 = (var_trim_start.get() / total_dur) * w if total_dur > 0 else 0
+                x1 = w - (var_trim_end.get() / total_dur) * w if total_dur > 0 else w
+                if abs(x - x0) < abs(x - x1):
+                    return "start"
+                return "end"
+            
+            def on_press(e):
+                x = e.x
+                drag_line[0] = nearest_line(x)
+            
+            canv.bind("<Button-1>", lambda e: (on_press(e), on_click(e)))
+            canv.bind("<B1-Motion>", on_drag)
+            canv.bind("<ButtonRelease-1>", on_release)
+            
+            def update_ui():
+                t0 = var_trim_start.get()
+                t1 = var_trim_end.get()
+                after_dur = max(0.01, total_dur - t0 - t1)
+                lbl_summary.config(text=f"去掉 开头 {t0:.2f}s + 结尾 {t1:.2f}s  →  保留 {after_dur:.2f}s", fg='#00ff88')
+                need_speed = after_dur > expected_dur and expected_dur > 0
+                chk_speed.config(state=tk.NORMAL if need_speed else tk.DISABLED)
+                if not need_speed:
+                    var_speed.set(False)
+                draw_all()
+            
+            draw_all()
+            canv.bind("<Configure>", lambda e: draw_all())
+            
+            lbl_summary = tk.Label(main_f, text=f"去掉 开头 0.00s + 结尾 0.00s  →  保留 {total_dur:.2f}s",
+                font=('Microsoft YaHei', 11, 'bold'), bg='#1a1a1a', fg='#00ff88')
+            lbl_summary.pack(anchor=tk.W, pady=6)
+            
+            ctrl_f = tk.Frame(main_f, bg='#1a1a1a')
+            ctrl_f.pack(fill=tk.X, pady=4)
+            tk.Label(ctrl_f, text="开头去掉:", font=('Microsoft YaHei', 9), bg='#1a1a1a', fg='#cccccc', width=8).pack(side=tk.LEFT)
+            ent_start = tk.Entry(ctrl_f, textvariable=var_trim_start, width=6, font=('Arial', 10))
+            ent_start.pack(side=tk.LEFT, padx=2)
+            ent_start.bind("<Return>", lambda e: (_parse_entry(ent_start, var_trim_start, 0, total_dur), update_ui()))
+            ent_start.bind("<FocusOut>", lambda e: (_parse_entry(ent_start, var_trim_start, 0, total_dur), update_ui()))
+            tk.Label(ctrl_f, text="s    结尾去掉:", font=('Microsoft YaHei', 9), bg='#1a1a1a', fg='#cccccc').pack(side=tk.LEFT, padx=(10, 0))
+            ent_end = tk.Entry(ctrl_f, textvariable=var_trim_end, width=6, font=('Arial', 10))
+            ent_end.pack(side=tk.LEFT, padx=2)
+            ent_end.bind("<Return>", lambda e: (_parse_entry(ent_end, var_trim_end, 0, total_dur), update_ui()))
+            ent_end.bind("<FocusOut>", lambda e: (_parse_entry(ent_end, var_trim_end, 0, total_dur), update_ui()))
+            tk.Label(ctrl_f, text="s  （也可直接输入数值）", font=('Microsoft YaHei', 9), bg='#1a1a1a', fg='#666666').pack(side=tk.LEFT)
+            
+            def _parse_entry(ent, var, lo, hi):
+                try:
+                    v = float(ent.get())
+                    var.set(max(lo, min(hi, v)))
+                except (ValueError, TypeError):
+                    pass
+            
+            var_speed = tk.BooleanVar(value=True)
+            need_speed_init = total_dur > expected_dur and expected_dur > 0
+            chk_speed = tk.Checkbutton(main_f, text="若仍超时则自动加速到预期时长", variable=var_speed,
+                font=('Microsoft YaHei', 10), bg='#1a1a1a', fg='#cccccc', selectcolor='#333333',
+                activebackground='#1a1a1a', activeforeground='#cccccc',
+                state=tk.NORMAL if need_speed_init else tk.DISABLED)
+            chk_speed.pack(anchor=tk.W, pady=8)
+            
+            def compute_trimmed_audio():
+                """按当前裁剪/加速设置计算输出音频（float32），失败返回 None"""
+                try:
+                    t0 = max(0, var_trim_start.get())
+                    t1 = max(0, var_trim_end.get())
+                    trim_start = int(t0 * rate)
+                    trim_end = int(t1 * rate)
+                    if trim_start + trim_end >= len(audio_int16):
+                        return None
+                    trimmed = audio_int16[trim_start:len(audio_int16) - trim_end].astype(np.float32) / 32767.0
+                    dur_after = len(trimmed) / rate
+                    do_speedup = var_speed.get() and expected_dur > 0 and dur_after > expected_dur
+                    if do_speedup:
+                        target_samples = int(expected_dur * rate)
+                        if target_samples < 1:
+                            target_samples = 1
+                        x_old = np.linspace(0, 1, len(trimmed))
+                        x_new = np.linspace(0, 1, target_samples)
+                        out_float = np.interp(x_new, x_old, trimmed)
+                    else:
+                        out_float = trimmed
+                    return np.clip(out_float, -1, 1).astype(np.float32)
+                except Exception:
+                    return None
+            
+            def do_preview():
+                audio = compute_trimmed_audio()
+                if audio is None:
+                    messagebox.showwarning("提示", "裁剪参数无效或裁剪过多")
+                    return
+                try:
+                    sd.play(audio, rate, blocking=False)
+                except Exception as ex:
+                    messagebox.showerror("错误", f"试听失败: {str(ex)}")
+            
+            def do_apply():
+                out_float = compute_trimmed_audio()
+                if out_float is None:
+                    messagebox.showwarning("提示", "裁剪过多，至少保留 0.01 秒")
+                    return
+                out_int16 = (out_float * 32767).astype(np.int16)
+                with wave.open(file_path, 'wb') as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(rate)
+                    wf.writeframes(out_int16.tobytes())
+                self.invalidate_score_cache(index)
+                if index in self.audio_cache:
+                    del self.audio_cache[index]
+                dlg.destroy()
+                self.status_label.config(text=f"✓ 已裁剪第 {index + 1} 句", fg='#00aa00')
+                self.root.after(2000, lambda: self.status_label.config(text="就绪", fg='black'))
+                # 完整刷新列表，避免单项更新逻辑导致的列表项消失
+                self.root.after(50, self.refresh_list)
+            
+            btn_f = tk.Frame(main_f, bg='#1a1a1a')
+            btn_f.pack(fill=tk.X, pady=15)
+            tk.Button(btn_f, text="▶ 试听", font=('Microsoft YaHei', 10), bg='#0078d4', fg='white',
+                command=do_preview, width=10, relief=tk.FLAT, cursor='hand2').pack(side=tk.LEFT, padx=(0, 5))
+            tk.Button(btn_f, text="应用", font=('Microsoft YaHei', 10), bg='#00aa00', fg='white',
+                command=do_apply, width=10, relief=tk.FLAT, cursor='hand2').pack(side=tk.LEFT, padx=5)
+            tk.Button(btn_f, text="取消", font=('Microsoft YaHei', 10), bg='#555555', fg='white',
+                command=dlg.destroy, width=10, relief=tk.FLAT, cursor='hand2').pack(side=tk.LEFT)
+            
+        except Exception as e:
+            messagebox.showerror("错误", f"裁剪失败: {str(e)}")
+
+    def _auto_trim_silence_for_segment(self, index, threshold=0.01, min_silence_dur=0.12, margin_dur=0.03):
+        """对单句音频自动裁剪首尾静音，返回是否实际发生了裁剪"""
+        file_path = os.path.join(self.recordings_dir, f"segment_{index:03d}.wav")
+        if not os.path.exists(file_path):
+            return False
+        
+        try:
+            with wave.open(file_path, 'rb') as wf:
+                nframes = wf.getnframes()
+                rate = wf.getframerate()
+                audio_int16 = np.frombuffer(wf.readframes(nframes), dtype=np.int16)
+            
+            if nframes <= 0:
+                return False
+            
+            audio_float = audio_int16.astype(np.float32) / 32767.0
+            abs_audio = np.abs(audio_float)
+            min_silence_frames = int(min_silence_dur * rate)
+            margin_frames = int(margin_dur * rate)
+            
+            # 找前面连续静音区末尾
+            start_idx = 0
+            while start_idx < nframes and abs_audio[start_idx] < threshold:
+                start_idx += 1
+            # 找后面连续静音区起点
+            end_idx = nframes - 1
+            while end_idx > start_idx and abs_audio[end_idx] < threshold:
+                end_idx -= 1
+            
+            # 加一点余量，避免剪得太紧
+            start_idx = max(0, start_idx - margin_frames)
+            end_idx = min(nframes - 1, end_idx + margin_frames)
+            
+            # 若有效内容太少或没有静音可剪，则跳过
+            if end_idx <= start_idx or start_idx < min_silence_frames and nframes - 1 - end_idx < min_silence_frames:
+                return False
+            
+            trimmed = audio_float[start_idx:end_idx + 1]
+            if len(trimmed) <= 0 or len(trimmed) == len(audio_float):
+                return False
+            
+            out_int16 = (np.clip(trimmed, -1, 1) * 32767).astype(np.int16)
+            with wave.open(file_path, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(rate)
+                wf.writeframes(out_int16.tobytes())
+            
+            # 更新缓存和评分
+            self.invalidate_score_cache(index)
+            if index in self.audio_cache:
+                del self.audio_cache[index]
+            return True
+        except Exception as e:
+            print(f"自动裁剪静音失败 index={index}: {e}")
+            return False
+    
+    def batch_auto_trim_silence(self):
+        """一键裁剪所有已录音频首尾静音"""
+        if not self.segments:
+            messagebox.showwarning("提示", "请先加载转录文件")
+            return
+        
+        if not self.recording_states:
+            messagebox.showinfo("提示", "还没有任何已录制的音频，无需裁剪")
+            return
+        
+        total_recorded = sum(1 for i in range(len(self.segments)) if self.recording_states.get(i))
+        if total_recorded == 0:
+            messagebox.showinfo("提示", "还没有任何已录制的音频，无需裁剪")
+            return
+        
+        if not messagebox.askyesno(
+            "确认一键裁剪",
+            f"将对所有已录制的 {total_recorded} 句音频自动裁剪首尾静音。\n\n"
+            "仅根据波形判断前后平坦区域，可能会略微剪到讲话的吸气/尾音。\n"
+            "该操作会直接覆盖原有音频文件，且不可撤销。\n\n是否继续？"
+        ):
+            return
+        
+        changed = 0
+        for i in range(len(self.segments)):
+            if self.recording_states.get(i):
+                if self._auto_trim_silence_for_segment(i):
+                    changed += 1
+        
+        # 全局刷新一次列表和显示
+        self.invalidate_score_cache()
+        self.refresh_list()
+        self.update_display()
+        
+        messagebox.showinfo("完成", f"已自动裁剪 {changed} 段音频的首尾静音。\n(总已录制: {total_recorded})")
     
     def show_statistics(self):
         """显示录制统计信息"""
