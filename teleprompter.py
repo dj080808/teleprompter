@@ -527,6 +527,54 @@ class TeleprompterApp:
         self.preview_merge_btn.grid(row=0, column=7, padx=5)
         ToolTip(self.preview_merge_btn, "试听合并版\n预览导出后的完整音频效果")
         
+        # 从当前句试听合并
+        self.preview_from_current_btn = tk.Button(
+            buttons_container,
+            text="▶从当前",
+            font=('Microsoft YaHei', 9),
+            bg='#444444',
+            fg='white',
+            command=self.preview_merged_from_current,
+            width=6,
+            height=1,
+            relief=tk.FLAT,
+            cursor='hand2'
+        )
+        self.preview_from_current_btn.grid(row=0, column=8, padx=2)
+        ToolTip(self.preview_from_current_btn, "从当前句开始试听合并音频\n只播放当前句及之后的片段")
+        
+        # 跳过按钮（语气词，合成时填静音）
+        self.skip_btn = tk.Button(
+            buttons_container,
+            text="跳过",
+            font=('Microsoft YaHei', 10),
+            bg='#555555',
+            fg='white',
+            command=self.toggle_skip_current,
+            width=5,
+            height=1,
+            relief=tk.FLAT,
+            cursor='hand2'
+        )
+        self.skip_btn.grid(row=0, column=9, padx=5)
+        ToolTip(self.skip_btn, "跳过(语气词)：当前句合成时用静音填充")
+        
+        # 合并按钮（与下一句合并）
+        self.merge_btn = tk.Button(
+            buttons_container,
+            text="合并",
+            font=('Microsoft YaHei', 10),
+            bg='#555555',
+            fg='white',
+            command=self.merge_current_with_next,
+            width=5,
+            height=1,
+            relief=tk.FLAT,
+            cursor='hand2'
+        )
+        self.merge_btn.grid(row=0, column=10, padx=5)
+        ToolTip(self.merge_btn, "与下一句合并：合成时连续播放无间隔")
+        
         # 音量监控条（录制时显示）
         volume_frame = tk.Frame(control_frame, bg='#1a1a1a')
         volume_frame.place(relx=0.1, rely=0.8, anchor=tk.W)
@@ -673,6 +721,9 @@ class TeleprompterApp:
         self.progress_label.config(
             text=f"{self.current_index + 1}/{len(self.segments)} {recorded_mark}"
         )
+        
+        # 更新底部跳过/合并按钮状态
+        self._update_skip_merge_btn_state()
         
         # 更新歌词显示
         self.render_ktv_lyrics()
@@ -880,21 +931,15 @@ class TeleprompterApp:
         """上一句"""
         if not self.segments:
             return
-        
         if self.current_index > 0:
-            self.current_index -= 1
-            self.update_display()
-            self.refresh_list()
+            self.jump_to_segment(self.current_index - 1)
     
     def next_segment(self):
         """下一句"""
         if not self.segments:
             return
-        
         if self.current_index < len(self.segments) - 1:
-            self.current_index += 1
-            self.update_display()
-            self.refresh_list()
+            self.jump_to_segment(self.current_index + 1)
     
     def toggle_play(self):
         """播放/暂停"""
@@ -1108,7 +1153,7 @@ class TeleprompterApp:
                 del self.audio_cache[self.current_index]  # 重录覆盖后需清除缓存，否则预览会播旧音频
             self.update_display()
             
-            # 录制完成后用完整刷新，避免单项更新导致列表项消失
+            # 录制完成后全量刷新，单项更新在重录时会导致列表项消失
             self.root.after(0, self.refresh_list)
             
             # 状态栏提示（2秒后自动消失）
@@ -1182,7 +1227,8 @@ class TeleprompterApp:
         top_row = tk.Frame(item_frame, bg=bg_color)
         top_row.pack(fill=tk.X, padx=5, pady=3)
         
-        num_label = tk.Label(top_row, text=f"#{i+1}", font=('Arial', 10, 'bold'), bg=bg_color, fg='#888888')
+        merge_badge = " 🔗" if self._is_in_merged_group(i) else ""
+        num_label = tk.Label(top_row, text=f"#{i+1}{merge_badge}", font=('Arial', 10, 'bold'), bg=bg_color, fg='#888888')
         num_label.pack(side=tk.LEFT)
         num_label.bind("<Button-1>", lambda e, idx=i: self.jump_to_segment(idx))
         
@@ -1253,15 +1299,6 @@ class TeleprompterApp:
         if 0 <= index < len(self.segments) and self._list_item_widgets:
             self._update_list_item(index)
     
-    def _update_list_item_async(self, index):
-        """后台计算评分后更新单项（录制结束用，避免阻塞 UI）"""
-        if not (0 <= index < len(self.segments) and self._list_item_widgets):
-            return
-        def compute_then_update():
-            score = self.calculate_score(index)
-            self.root.after(0, lambda: self._update_list_item_with_score(index, score))
-        threading.Thread(target=compute_then_update, daemon=True).start()
-    
     def _update_list_item_with_score(self, index, score):
         """用已知评分更新单项（主线程调用）"""
         if index not in self._list_item_widgets:
@@ -1330,11 +1367,21 @@ class TeleprompterApp:
             tip_label.pack(expand=True, pady=50)
             return
         
-        # 创建每个句子的列表项
-        for i, seg in enumerate(self.segments):
-            self._create_list_item(i)
-        
-        self._list_current_index = self.current_index
+        # 创建每个句子的列表项（数量多时分批创建，避免界面假死）
+        batch_size = 40
+        if len(self.segments) <= batch_size:
+            for i, seg in enumerate(self.segments):
+                self._create_list_item(i)
+            self._list_current_index = self.current_index
+        else:
+            self._list_current_index = self.current_index
+            def create_batch(start=0):
+                end = min(start + batch_size, len(self.segments))
+                for i in range(start, end):
+                    self._create_list_item(i)
+                if end < len(self.segments):
+                    self.root.after(5, lambda: create_batch(end))
+            create_batch(0)
     
     def update_list_highlight_only(self, prev_index, curr_index):
         """仅更新高亮状态（不重建列表），用于跳转时避免卡顿"""
@@ -1352,7 +1399,9 @@ class TeleprompterApp:
             info = self._list_item_widgets[idx]
             is_current = (idx == self.current_index)
             is_recorded = self.recording_states.get(idx, False)
-            score = self.calculate_score(idx) if is_recorded else None
+            score = self._score_cache.get(idx) if is_recorded else None
+            if is_recorded and score is None:
+                score = self.calculate_score(idx)
             
             if is_current:
                 bg_color = '#2d5a8a'
@@ -1364,7 +1413,8 @@ class TeleprompterApp:
             apply_bg([
                 info["frame"], info["top_row"], info["num_label"],
                 info["status_label"], info.get("dur_label"), info["text_label"],
-                info.get("score_label"), info.get("trim_btn"), info.get("waveform_btn")
+                info.get("score_label"), info.get("trim_btn"), info.get("waveform_btn"),
+                info.get("skip_btn"), info.get("merge_btn")
             ], bg_color)
     
     def invalidate_score_cache(self, index=None):
@@ -1641,6 +1691,8 @@ class TeleprompterApp:
             self.is_previewing = False
             self._cancel_preview_timeline()
             self.preview_merge_btn.config(text="📀", bg='#555555')
+            if hasattr(self, 'preview_from_current_btn'):
+                self.preview_from_current_btn.config(text="▶从当前", bg='#444444')
             self.preview_btn.config(text="🔊", bg='#0078d4')
             return
         try:
@@ -1670,6 +1722,49 @@ class TeleprompterApp:
         except Exception as e:
             self.is_previewing = False
             self.preview_merge_btn.config(text="📀", bg='#555555')
+            messagebox.showerror("错误", f"试听失败: {str(e)}")
+    
+    def preview_merged_from_current(self):
+        """从当前句开始往下试听合并音频"""
+        if not self.segments:
+            messagebox.showwarning("提示", "请先加载转录文件")
+            return
+        if not self.recording_states:
+            messagebox.showwarning("提示", "还没有录制任何音频")
+            return
+        if self.is_previewing:
+            sd.stop()
+            self.is_previewing = False
+            self._cancel_preview_timeline()
+            self.preview_merge_btn.config(text="📀", bg='#555555')
+            self.preview_from_current_btn.config(text="▶从当前", bg='#444444')
+            return
+        try:
+            start_idx = self.current_index
+            frames_bytes, rate, timeline = self._build_merged_audio_frames(start_from_index=start_idx)
+            if not frames_bytes:
+                messagebox.showwarning("提示", "从当前句开始没有可播放的音频")
+                return
+            audio_data = np.frombuffer(frames_bytes, dtype=np.int16).astype(np.float32) / 32767.0
+            self.is_previewing = True
+            self._preview_after_ids = []
+            self.preview_from_current_btn.config(text="⏹", bg='#ff8800')
+            if timeline:
+                self.jump_to_segment(timeline[0][0])
+            def finished():
+                self.is_previewing = False
+                self._cancel_preview_timeline()
+                self.preview_from_current_btn.config(text="▶从当前", bg='#444444')
+            for idx, start_sec in timeline:
+                ms = int(start_sec * 1000)
+                aid = self.root.after(ms, lambda i=idx: self._preview_jump_to_segment(i))
+                self._preview_after_ids.append(aid)
+            sd.play(audio_data, rate, blocking=False)
+            duration_ms = int(len(audio_data) / rate * 1000)
+            self.root.after(duration_ms, finished)
+        except Exception as e:
+            self.is_previewing = False
+            self.preview_from_current_btn.config(text="▶从当前", bg='#444444')
             messagebox.showerror("错误", f"试听失败: {str(e)}")
     
     def _cancel_preview_timeline(self):
@@ -1809,9 +1904,10 @@ class TeleprompterApp:
         except Exception as e:
             messagebox.showerror("错误", f"导出失败: {str(e)}")
     
-    def _build_merged_audio_frames(self):
+    def _build_merged_audio_frames(self, start_from_index=0):
         """构建合并后的音频帧序列，供导出和试听使用。返回 (frames_bytes, sample_rate, timeline)
-        timeline: [(segment_index, start_sec_in_output), ...] 各句在合并音频中的开始时间"""
+        每句严格占用字幕中的 [start_time, end_time] 槽位，保证与视频对齐。
+        start_from_index: 从该句开始构建（用于从当前句试听），0 表示从头"""
         if not self.segments:
             return b'', self.sample_rate, []
         groups = self.merge_groups if self.merge_groups else [[i] for i in range(len(self.segments))]
@@ -1819,30 +1915,50 @@ class TeleprompterApp:
         timeline = []
         output_time = 0.0
         last_end_time = 0
+        first_output = True
+        sr = self.sample_rate
         for group in sorted(groups, key=lambda g: min(g)):
-            seg_first = self.segments[group[0]]
+            group_filtered = [i for i in group if i >= start_from_index]
+            if not group_filtered:
+                continue
+            seg_first = self.segments[group_filtered[0]]
             gap = seg_first['start_time'] - last_end_time
-            if gap > 0:
-                silence_frames = int(gap * self.sample_rate)
+            if gap > 0 and not first_output:
+                silence_frames = int(gap * sr)
                 frames_list.append(np.zeros(silence_frames, dtype=np.int16).tobytes())
                 output_time += gap
-            for i in group:
+            first_output = False
+            for i in group_filtered:
                 seg = self.segments[i]
+                slot_dur = seg['duration']
+                slot_frames = int(slot_dur * sr)
                 timeline.append((i, output_time))
                 file_path = os.path.join(self.recordings_dir, f"segment_{i:03d}.wav")
                 if self.skip_states.get(i):
-                    duration_frames = int(seg['duration'] * self.sample_rate)
-                    frames_list.append(np.zeros(duration_frames, dtype=np.int16).tobytes())
-                    output_time += seg['duration']
+                    frames_list.append(np.zeros(slot_frames, dtype=np.int16).tobytes())
                 elif os.path.exists(file_path):
                     with wave.open(file_path, 'rb') as wf:
                         data = wf.readframes(wf.getnframes())
+                        n = len(data) // 2
+                    want_n = int(slot_dur * sr)
+                    if n < want_n:
+                        # 不足则开头填静音
+                        pad_n = want_n - n
+                        pad_b = np.zeros(pad_n, dtype=np.int16).tobytes()
+                        frames_list.append(pad_b + data)
+                    elif n > want_n:
+                        # 超时则加速（线性插值重采样）
+                        audio_float = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32767.0
+                        x_old = np.linspace(0, 1, n)
+                        x_new = np.linspace(0, 1, want_n)
+                        out_float = np.interp(x_new, x_old, audio_float)
+                        out_int16 = (np.clip(out_float, -1, 1) * 32767).astype(np.int16)
+                        frames_list.append(out_int16.tobytes())
+                    else:
                         frames_list.append(data)
-                        output_time += len(data) / 2 / self.sample_rate
                 else:
-                    duration_frames = int(seg['duration'] * self.sample_rate)
-                    frames_list.append(np.zeros(duration_frames, dtype=np.int16).tobytes())
-                    output_time += seg['duration']
+                    frames_list.append(np.zeros(slot_frames, dtype=np.int16).tobytes())
+                output_time += slot_dur
                 last_end_time = seg['end_time']
         return b''.join(frames_list), self.sample_rate, timeline
     
@@ -1901,6 +2017,33 @@ class TeleprompterApp:
         except Exception as e:
             messagebox.showerror("错误", f"删除失败: {str(e)}")
     
+    def toggle_skip_current(self):
+        """底部按钮：切换当前句的跳过状态"""
+        if not self.segments:
+            return
+        self.toggle_skip(self.current_index)
+        self._update_skip_merge_btn_state()
+    
+    def merge_current_with_next(self):
+        """底部按钮：将当前句与下一句合并"""
+        if not self.segments:
+            return
+        self.merge_with_next(self.current_index)
+    
+    def _update_skip_merge_btn_state(self):
+        """更新底部跳过/合并按钮的显示状态"""
+        if not hasattr(self, 'skip_btn') or not self.segments:
+            return
+        if self.skip_states.get(self.current_index, False):
+            self.skip_btn.config(text="已跳", bg='#ff9900', fg='black')
+        else:
+            self.skip_btn.config(text="跳过", bg='#555555', fg='white')
+        if hasattr(self, 'merge_btn'):
+            if self.current_index < len(self.segments) - 1:
+                self.merge_btn.config(state=tk.NORMAL)
+            else:
+                self.merge_btn.config(state=tk.DISABLED)
+    
     def toggle_skip(self, index):
         """切换跳过状态（语气词，合成时填静音）"""
         if not self.segments or not (0 <= index < len(self.segments)):
@@ -1913,6 +2056,15 @@ class TeleprompterApp:
             fg='orange'
         )
         self.root.after(2000, lambda: self.status_label.config(text="就绪", fg="black"))
+    
+    def _is_in_merged_group(self, index):
+        """判断该句是否在合并组内（组内有多句）"""
+        if not self.merge_groups:
+            return False
+        for g in self.merge_groups:
+            if index in g and len(g) > 1:
+                return True
+        return False
     
     def merge_with_next(self, index):
         """将当前句与下一句合并（合成时连续播放无间隔）"""
@@ -1933,7 +2085,10 @@ class TeleprompterApp:
         self.merge_groups = [g for k, g in enumerate(self.merge_groups) if k not in (gi, gj)]
         self.merge_groups.append(new_group)
         self.merge_groups.sort(key=lambda g: min(g))
-        self.refresh_list()
+        # 更新列表中受影响项的显示（显示合并标记）
+        for idx in new_group:
+            if idx in self._list_item_widgets:
+                self._update_list_item_safe(idx)
         self.status_label.config(text=f"#{index+1} 与 #{index+2} 已合并", fg='#00aa00')
         self.root.after(2000, lambda: self.status_label.config(text="就绪", fg="black"))
 
