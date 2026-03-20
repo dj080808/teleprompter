@@ -179,13 +179,13 @@ class TeleprompterApp:
                 messagebox.showwarning("提示", "文件不存在")
                 return
             
-            # 检查文件扩展名
-            if not file_path.lower().endswith('.txt'):
-                messagebox.showwarning("提示", "请拖拽 .txt 格式的转录文件")
-                return
-            
-            # 加载文件
-            self.load_transcript_file(file_path)
+            # 检查文件类型
+            if file_path.lower().endswith('project_meta.json'):
+                self._load_project_from_path(file_path)
+            elif file_path.lower().endswith('.txt'):
+                self.load_transcript_file(file_path)
+            else:
+                messagebox.showwarning("提示", "请拖拽 .txt 转录文件 或 project_meta.json 工程")
             
         except Exception as e:
             print(f"拖拽处理错误: {e}")
@@ -213,20 +213,20 @@ class TeleprompterApp:
         self.mode_btn.pack(side=tk.LEFT, padx=15, pady=15)
         ToolTip(self.mode_btn, "切换播放模式\n手动模式: 手动控制切换句子\n自动模式: 按时间轴自动播放")
         
-        # 文件加载按钮
+        # 打开文件/工程按钮（统一入口，支持 .txt 和 工程）
         load_btn = tk.Button(
             top_frame,
-            text="📂 加载文件",
+            text="📂 打开",
             font=('Microsoft YaHei', 11),
             bg='#0078d4',
             fg='white',
-            command=self.load_file,
+            command=self.open_file_or_project,
             width=12,
             relief=tk.FLAT,
             cursor='hand2'
         )
         load_btn.pack(side=tk.LEFT, padx=5, pady=15)
-        ToolTip(load_btn, "打开文件选择对话框\n加载Whisper转录文件")
+        ToolTip(load_btn, "打开转录文件 (.txt) 或 工程 (project_meta.json)\n加载后界面一致")
         
         # 统计按钮
         stats_btn = tk.Button(
@@ -543,38 +543,6 @@ class TeleprompterApp:
         self.preview_from_current_btn.grid(row=0, column=8, padx=2)
         ToolTip(self.preview_from_current_btn, "从当前句开始试听合并音频\n只播放当前句及之后的片段")
         
-        # 跳过按钮（语气词，合成时填静音）
-        self.skip_btn = tk.Button(
-            buttons_container,
-            text="跳过",
-            font=('Microsoft YaHei', 10),
-            bg='#555555',
-            fg='white',
-            command=self.toggle_skip_current,
-            width=5,
-            height=1,
-            relief=tk.FLAT,
-            cursor='hand2'
-        )
-        self.skip_btn.grid(row=0, column=9, padx=5)
-        ToolTip(self.skip_btn, "跳过(语气词)：当前句合成时用静音填充")
-        
-        # 合并按钮（与下一句合并）
-        self.merge_btn = tk.Button(
-            buttons_container,
-            text="合并",
-            font=('Microsoft YaHei', 10),
-            bg='#555555',
-            fg='white',
-            command=self.merge_current_with_next,
-            width=5,
-            height=1,
-            relief=tk.FLAT,
-            cursor='hand2'
-        )
-        self.merge_btn.grid(row=0, column=10, padx=5)
-        ToolTip(self.merge_btn, "与下一句合并：合成时连续播放无间隔")
-        
         # 音量监控条（录制时显示）
         volume_frame = tk.Frame(control_frame, bg='#1a1a1a')
         volume_frame.place(relx=0.1, rely=0.8, anchor=tk.W)
@@ -653,22 +621,41 @@ class TeleprompterApp:
         self.root.bind('<F1>', lambda e: self.show_help_dialog())
         self.root.bind('<F5>', lambda e: self.show_statistics())
         self.root.bind('<Control-s>', lambda e: self.save_project())
-        self.root.bind('<Control-o>', lambda e: self.load_project())
+        self.root.bind('<Control-o>', lambda e: self.open_file_or_project())
         
-    def load_file(self):
-        """加载转录文件"""
-        file_path = filedialog.askopenfilename(
-            title="选择转录文件",
-            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+    def open_file_or_project(self):
+        """打开转录文件或工程，统一使用文件选择对话框，加载后界面一致"""
+        path = filedialog.askopenfilename(
+            title="选择转录文件或工程",
+            filetypes=[
+                ("转录文件 / 工程", "*.txt;project_meta.json"),
+                ("转录文件", "*.txt"),
+                ("工程", "project_meta.json"),
+                ("所有文件", "*.*")
+            ],
             initialdir=os.getcwd()
         )
-        
-        if file_path:
-            self.load_transcript_file(file_path)
+        if not path:
+            return
+        if path.endswith("project_meta.json"):
+            self._load_project_from_path(path)
+        else:
+            self.load_transcript_file(path)
     
-    def load_transcript_file(self, file_path):
-        """加载转录文件的通用方法"""
+    def load_file(self):
+        """加载转录文件（保留供快捷键等调用）"""
+        self.open_file_or_project()
+    
+    def load_transcript_file(self, file_path, show_message=True, clear_recordings=True):
+        """加载转录文件的通用方法，加载后界面一致。
+        clear_recordings: 加载新 txt 时为 True（不同文件才清空）；加载工程时为 False（工程已复制音频）。"""
         try:
+            # 判断是否是同一个文件（再次加载同一 txt 时保留录音）
+            path_resolved = os.path.abspath(os.path.normpath(file_path))
+            same_file = bool(
+                getattr(self, 'current_transcript_path', None) and
+                os.path.abspath(os.path.normpath(self.current_transcript_path)) == path_resolved
+            )
             self.current_transcript_path = file_path
             self.segments = parse_transcript_file(file_path)
             self.current_index = 0
@@ -678,8 +665,19 @@ class TeleprompterApp:
             self.word_progress = 0.0
             self.invalidate_score_cache()  # 新文件加载，清空评分缓存
             
-            # 根据 recordings 目录中已存在的文件恢复录制状态
-            self.restore_recording_states()
+            if clear_recordings and not same_file:
+                # 不同 txt 文档：清空旧录音和缓存，保证干净列表
+                self.audio_cache.clear()
+                if os.path.exists(self.recordings_dir):
+                    for name in os.listdir(self.recordings_dir):
+                        if name.endswith('.wav') and name.startswith('segment_'):
+                            try:
+                                os.remove(os.path.join(self.recordings_dir, name))
+                            except OSError:
+                                pass
+            else:
+                # 同一文件再次加载 或 加载工程：从 recordings 恢复录制状态
+                self.restore_recording_states()
             
             self.status_label.config(
                 text=f"已加载 {len(self.segments)} 个句子",
@@ -688,7 +686,8 @@ class TeleprompterApp:
             self.update_display()
             self.refresh_list()
             
-            messagebox.showinfo("成功", f"已加载 {len(self.segments)} 个句子")
+            if show_message:
+                messagebox.showinfo("成功", f"已加载 {len(self.segments)} 个句子")
         except Exception as e:
             messagebox.showerror("错误", f"加载文件失败: {str(e)}")
     
@@ -764,7 +763,7 @@ class TeleprompterApp:
             
             self.lyrics_canvas.create_text(
                 canvas_width / 2, canvas_height / 2 + 40,
-                text="KTV 提词器",
+                text="配音 提词器",
                 font=('Microsoft YaHei', 32, 'bold'),
                 fill='#666666',
                 anchor=tk.CENTER
@@ -1227,8 +1226,7 @@ class TeleprompterApp:
         top_row = tk.Frame(item_frame, bg=bg_color)
         top_row.pack(fill=tk.X, padx=5, pady=3)
         
-        merge_badge = " 🔗" if self._is_in_merged_group(i) else ""
-        num_label = tk.Label(top_row, text=f"#{i+1}{merge_badge}", font=('Arial', 10, 'bold'), bg=bg_color, fg='#888888')
+        num_label = tk.Label(top_row, text=f"#{i+1}", font=('Arial', 10, 'bold'), bg=bg_color, fg='#888888')
         num_label.pack(side=tk.LEFT)
         num_label.bind("<Button-1>", lambda e, idx=i: self.jump_to_segment(idx))
         
@@ -1250,20 +1248,7 @@ class TeleprompterApp:
         dur_label.pack(side=tk.LEFT, padx=(0, 8))
         dur_label.bind("<Button-1>", lambda e, idx=i: self.jump_to_segment(idx))
         
-        score_label, waveform_btn, trim_btn, skip_btn, merge_btn = None, None, None, None, None
-        # 跳过按钮（语气词，合成时填静音）
-        is_skip = self.skip_states.get(i, False)
-        skip_btn = tk.Button(top_row, text="⏭" if is_skip else "跳", font=('Arial', 9), bg=bg_color,
-            fg='#ff9900' if is_skip else '#666666', command=lambda idx=i: self.toggle_skip(idx),
-            relief=tk.FLAT, cursor='hand2', padx=2)
-        skip_btn.pack(side=tk.RIGHT)
-        ToolTip(skip_btn, "跳过(语气词)：合成时用静音填充，不播放录音")
-        # 合并按钮（与下一句合并）
-        if i < len(self.segments) - 1:
-            merge_btn = tk.Button(top_row, text="🔗", font=('Arial', 9), bg=bg_color, fg='#00aaff',
-                command=lambda idx=i: self.merge_with_next(idx), relief=tk.FLAT, cursor='hand2', padx=2)
-            merge_btn.pack(side=tk.RIGHT)
-            ToolTip(merge_btn, "与下一句合并：合成时连续播放无间隔")
+        score_label, waveform_btn, trim_btn = None, None, None
         if score is not None:
             score_color = '#00ff00' if score >= 80 else ('#ffaa00' if score >= 60 else '#ff3333')
             score_text = f"⭐ {score}" if score >= 80 else (f"★ {score}" if score >= 60 else f"⚠ {score}")
@@ -1289,7 +1274,6 @@ class TeleprompterApp:
             "frame": item_frame, "top_row": top_row, "num_label": num_label,
             "status_label": status_label, "dur_label": dur_label, "text_label": text_label,
             "score_label": score_label, "trim_btn": trim_btn, "waveform_btn": waveform_btn,
-            "skip_btn": skip_btn, "merge_btn": merge_btn,
         }
         self._list_item_widgets[i] = info
         return info
@@ -1413,8 +1397,7 @@ class TeleprompterApp:
             apply_bg([
                 info["frame"], info["top_row"], info["num_label"],
                 info["status_label"], info.get("dur_label"), info["text_label"],
-                info.get("score_label"), info.get("trim_btn"), info.get("waveform_btn"),
-                info.get("skip_btn"), info.get("merge_btn")
+                info.get("score_label"), info.get("trim_btn"), info.get("waveform_btn")
             ], bg_color)
     
     def invalidate_score_cache(self, index=None):
@@ -1562,7 +1545,7 @@ class TeleprompterApp:
                 # 每次创建新的引擎实例
                 engine = pyttsx3.init()
                 engine.setProperty('rate', 150)
-                engine.setProperty('volume', 0.9)
+                engine.setProperty('volume', 1.0)  # 最大音量
                 
                 # 尝试设置英文语音
                 voices = engine.getProperty('voices')
@@ -1579,10 +1562,12 @@ class TeleprompterApp:
                 time.sleep(0.3)
                 
                 if os.path.exists(ai_file):
-                    # 播放生成的音频
+                    # 播放生成的音频（增强音量，TTS 输出通常偏小）
+                    ai_volume_gain = 2.0  # 放大倍数
                     with wave.open(ai_file, 'rb') as wf:
                         audio_data = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
                         audio_float = audio_data.astype(np.float32) / 32767.0
+                        audio_float = np.clip(audio_float * ai_volume_gain, -1.0, 1.0)
                         sample_rate = wf.getframerate()
                     
                     # 播放
@@ -1825,15 +1810,23 @@ class TeleprompterApp:
         except Exception as e:
             messagebox.showerror("错误", f"存档失败: {e}")
     
+    def _load_project_from_path(self, meta_path):
+        """从 project_meta.json 路径恢复工程，界面与加载文件一致"""
+        project_root = os.path.dirname(os.path.abspath(meta_path))
+        self._do_load_project(project_root, meta_path)
+    
     def load_project(self):
-        """从工程存档目录恢复字幕和音频"""
-        project_root = filedialog.askdirectory(
-            title="选择工程存档目录（含 project_meta.json）",
-            mustexist=True
+        """从工程存档目录恢复（兼容旧方式，现统一用打开对话框）"""
+        path = filedialog.askopenfilename(
+            title="选择工程文件 project_meta.json",
+            filetypes=[("工程", "project_meta.json"), ("所有文件", "*.*")],
+            initialdir=os.getcwd()
         )
-        if not project_root:
-            return
-        meta_path = os.path.join(project_root, "project_meta.json")
+        if path:
+            self._load_project_from_path(path)
+    
+    def _do_load_project(self, project_root, meta_path):
+        """执行工程加载逻辑"""
         if not os.path.exists(meta_path):
             messagebox.showerror("错误", "所选目录中没有 project_meta.json，无法识别为工程存档")
             return
@@ -1863,16 +1856,29 @@ class TeleprompterApp:
                 if name.endswith(".wav"):
                     shutil.copy2(os.path.join(audio_dir, name),
                                  os.path.join(self.recordings_dir, name))
-            # 加载字幕并套用状态
-            self.load_transcript_file(project_transcript)
-            self.recording_states = meta.get("recording_states", {})
-            self.skip_states = meta.get("skip_states", {})
-            self.merge_groups = meta.get("merge_groups", [[i for i in range(len(self.segments))]])
+            # 加载字幕并套用状态，与加载文件后界面一致（不清空 recordings，工程已复制音频）
+            self.load_transcript_file(project_transcript, show_message=False, clear_recordings=False)
+            # JSON 的 key 是字符串，需转回 int 才能正确匹配 is_recorded 等，显示波形/裁剪按钮
+            def _dict_keys_to_int(d):
+                out = {}
+                for k, v in d.items():
+                    try:
+                        out[int(k)] = bool(v)
+                    except (ValueError, TypeError):
+                        pass
+                return out
+            self.recording_states = _dict_keys_to_int(meta.get("recording_states", {}))
+            self.skip_states = _dict_keys_to_int(meta.get("skip_states", {}))
+            raw_mg = meta.get("merge_groups", [])
+            try:
+                self.merge_groups = [[int(x) for x in g] for g in raw_mg] if raw_mg else [[i for i in range(len(self.segments))]]
+            except (ValueError, TypeError):
+                self.merge_groups = [[i for i in range(len(self.segments))]]
             self.invalidate_score_cache()
             self.refresh_list()
             self.update_display()
             self.current_project_path = project_root
-            messagebox.showinfo("成功", f"已从工程恢复：\n{project_root}")
+            messagebox.showinfo("成功", f"已加载 {len(self.segments)} 个句子")
         except Exception as e:
             messagebox.showerror("错误", f"读取工程失败: {e}")
 
@@ -2031,18 +2037,8 @@ class TeleprompterApp:
         self.merge_with_next(self.current_index)
     
     def _update_skip_merge_btn_state(self):
-        """更新底部跳过/合并按钮的显示状态"""
-        if not hasattr(self, 'skip_btn') or not self.segments:
-            return
-        if self.skip_states.get(self.current_index, False):
-            self.skip_btn.config(text="已跳", bg='#ff9900', fg='black')
-        else:
-            self.skip_btn.config(text="跳过", bg='#555555', fg='white')
-        if hasattr(self, 'merge_btn'):
-            if self.current_index < len(self.segments) - 1:
-                self.merge_btn.config(state=tk.NORMAL)
-            else:
-                self.merge_btn.config(state=tk.DISABLED)
+        """占位，跳过/合并按钮已移除"""
+        pass
     
     def toggle_skip(self, index):
         """切换跳过状态（语气词，合成时填静音）"""
@@ -2828,7 +2824,7 @@ def main():
     app = TeleprompterApp(root)
     
     # 尝试自动加载当前目录的文件
-    default_file = "RA2_English_Colloquial.txt"
+    default_file = "Mat1st_english.txt"
     if os.path.exists(default_file):
         app.segments = parse_transcript_file(default_file)
         app.current_index = 0
