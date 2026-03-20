@@ -108,5 +108,26 @@ This is an eight-player free-for-all.
 | 文件 | 说明 |
 |------|------|
 | `teleprompter.py` | 提词器主程序 |
-| `parser.py` | 转录文件解析 |
-| `key_remap.py` | 独立改键脚本（按 `,` 连按 `d` 100 次，需 `keyboard` 库） |
+| `bilibili_transcribe.py` | B 站视频转录工具（见下方） |
+
+### bilibili_transcribe.py
+
+输入 B 站视频 URL，下载音频并用 Whisper 语音识别，输出提词器可用的 `*_transcript.txt` 和 `*_segments.json`。
+
+**依赖：**
+```bash
+pip install yt-dlp torch whisper
+```
+系统需安装 ffmpeg（yt-dlp 转音频用）。
+
+**用法：**
+```bash
+python bilibili_transcribe.py "https://www.bilibili.com/video/BVxxxxxx"
+python bilibili_transcribe.py "https://b23.tv/xxxx" --model base --output-dir ./out
+```
+
+**参数：**
+- `--output-dir` / `-o`：输出目录，默认当前目录
+- `--model` / `-m`：Whisper 模型（tiny/base/small/medium/large），默认 medium
+- `--lang`：识别语言（auto/zh/en），默认 auto
+- `--keep-audio`：保留下载的音频文件
